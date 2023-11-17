@@ -1,257 +1,632 @@
+from music import *
+from sat_util import *
 from itertools import *
 from collections import *
-from math import *
+from dataclasses import dataclass, field
+from typing import List
+from music21 import *
 
-from sat_util import *
-from music import *
+MEASURE_TUPLE = 2
+BEAT_TUPLE = 1
+#COF_LO, COF_HI = -1, 5+1 # diatonic scale
+#COF_LO, COF_HI = -6, 5+1 # chromatic scale (all flat)
+COF_LO, COF_HI = -6, 9+1 # Db - D#, usually enough
+# COF_LO, COF_HI = -7, 14 # Cb - Fx, pretty much all practically used notes
+
+COFS = list(range(COF_LO, COF_HI))
+
+########
+## Equivalence under transformation
+########
+# define equivalence between voices vector of bitsets of pitches under dynamic time & pitch transformations
+# this gives you the tools to set up some canonic form with variance in time and pitch transforms
+# and all further code can just evaluate this 2D pitch-bitset array as if it's a static thing.
+##################################
+
+@dataclass
+class PitchTransform:
+	# list of legal transposition intervals in CoF notation
+	valid_transpositions:List[int] = field(default_factory=list)
+	# 7 = diatonic, 12 = enharmonic, 0 = strict equivalance
+	mod:int = 7
+	# 1 is regular, -1 inversed
+	scale:List[int] = field(default_factory=list)
+
+@dataclass
+class TimeTransform:
+	rotations:List[int] = field(default_factory=list)
+	scales:List[int] = field(default_factory=list)
+	reorderings:List[List[int]] = field(default_factory=list)
+
+@dataclass
+class Chord:
+	# result from create_pitch, chroma bitset
+	root:dict = field(default_factory=dict)
+	chroma:dict = field(default_factory=dict)
+
+	# boolean variables that describe all valid chords
+	major:int = field(default_factory=int)
+	seven:int = field(default_factory=int)
+	dim:int = field(default_factory=int)
+
+def create_pitch(problem, lo = None, hi = None):
+	if lo is None: lo, hi = COF_LO, COF_HI
+	pitch = {c:problem.make_var() for c in range(lo, hi)}
+	pitch['rest'] = problem.make_var()
+	problem.exactly(1, list(pitch.values()))
+	return pitch
+
+def create_chord(problem):
+	lo, hi = COF_LO, COF_HI
+	pitch = {c:problem.make_var() for c in range(lo, hi)}
+	pitch['rest'] = problem.make_var()
+	problem.exactly(1, list(pitch.values()))
+	return pitch
+
+def equivalent_under_pitch_transform(problem, a, b, transposition, rep, distance, short_circuit = []):
+	transposition = {rep(k):v for k,v in transposition.items()}
+	classes = {x:set(y) for x,y in groupby(sorted(range(-7, 12), key=rep), key=rep)}
+	for g1, g2 in product(classes.items(), classes.items()):
+		if (d := rep(distance(g1[0], g2[0]))) in transposition:
+			g1 = [a[x] for x in g1[1] if x in a]
+			g2 = [b[x] for x in g2[1] if x in b]
+			for x in g2: problem.add_clause(g1 + [-x, -transposition[d]] + short_circuit)
+			for x in g1: problem.add_clause(g2 + [-x, -transposition[d]] + short_circuit)
+
+def linear_pitch_equivalence(problem, a, b, transposition, pitch_transform, offset, short_circuit = []):
+	repr_pitch = (lambda x: x%pitch_transform.mod if pitch_transform.mod else x)
+	for scale in pitch_transform.scale:
+		t = {k[0]+offset:v for k,v in transposition.items() if k[1] == scale}
+		equivalent_under_pitch_transform(problem, a, b, t, repr_pitch, (lambda x,y: y*scale - x), short_circuit)
+
+	# regardless of the transposition a rest remains a rest
+	problem.add_clause([-a['rest'], b['rest']] + short_circuit)
+	problem.add_clause([a['rest'], -b['rest']] + short_circuit)
+
+def apply_time_transform_vector(v, rotate, scale, reorder):
+	v = [v[j] for j in reorder]
+	v = (v[rotate:] + v[:rotate])[::max(-1, min(scale, 1))]
+	v = list(chain(*[[x]*abs(scale) for x in v]))
+	return v
+
+# the time transforms talk about rotation but in practice this means having an infinite canons
+# now rotation doesn't map onto infinite modulation canons as the repeats are not the same
+# this is what the modulation parameter is for, it allows you to specify how the rotated section
+# of the theme is transposed in addition to the the transformation after pitch_transform
+def transformational_equivalence(problem, a, pitch_transform, time_transform, modulation = 0, add_extra = 0):
+	# intermediate variabels for the equivalent voice
+	scale = max(map(abs, time_transform.scales))
+	b = [create_pitch(problem) for _ in range(len(a)*scale + add_extra)]
+	
+	if not time_transform.reorderings:
+		time_transform = TimeTransform(time_transform.rotations, time_transform.scales, [list(range(len(a)))])
+
+	# variables for controlling transform
+	transposition = {(c,s):problem.make_var() for c,s in product(pitch_transform.valid_transpositions, pitch_transform.scale)}
+	time = {(r,s,tuple(o)): problem.make_var() for r,s,o in product(time_transform.rotations, time_transform.scales, time_transform.reorderings)}
+
+	#problem.add_clause(list(transposition.values()))
+	#problem.add_clause(list(time.values()))
+	
+	problem.exactly(1, list(transposition.values()))
+	problem.exactly(1, list(time.values()))
+
+	# specify equivalence
+	for t,t_var in time.items():
+		at = apply_time_transform_vector(a, *t)
+		if add_extra:
+			at += (at*8)[:add_extra]
+		
+		rs = t[0]*t[1]
+		for i,(p,q) in enumerate(zip(at, b)):
+			linear_pitch_equivalence(problem, p, q, transposition, pitch_transform, modulation*(i >= (len(a)*scale-rs)), [-t_var])
+
+	return (transposition, time, b)
+
+###########
+# Reasonable melodic lines
+###########
+
+# extract specific pitches from voice
+def context(x, n): return list(zip(*[x[i:] for i in range(n)]))
+def groupn(x, n): return [x[i:i+n] for i in range(0, len(x), n)]
+def beats(voice): return groupn(voice, BEAT_TUPLE)
+def harmonies(voices): return list(zip(*voices))
+def beat_notes(voice): return voice[::BEAT_TUPLE]
+
+# note to note rules
+# rest_allowed = 0, no rests
+# rest_allowed = 1, any rests are ok
+# rest_allowed = 2, rests are ok but only 0 or 2 rests
+# rest_allowed = 3, `b` can only be a rest if `a` is a rest
+def enforce_interval(problem, a, b, motion, except_when = [], rest_allowed = 1):
+	problem.add_clause([[*except_when, b['rest'], -a[i], *[b[i+j] for j in motion if i+j in COFS]] for i in COFS])
+
+def stepwise(problem, a, b, except_when = [], rest_allowed = 1):
+	enforce_interval(problem, a, b, [0, -2,2,-5,5], except_when, rest_allowed)
+
+def no_false_relations(problem, a, b, tritones = False, half_tones = True, whole_tones = True, except_when = []):
+	intervals = [-4,-3,-1,0,1,3,4] + [2,-2]*whole_tones + [-5,5]*half_tones + [-6,6]*tritones
+	#intervals = [i+j for i in intervals for j in range(-24,25,12)]
+	enforce_interval(problem, a, b, intervals, except_when, 1)
+
+def create_dux(problem, duration):
+	return [create_pitch(problem) for _ in range(duration)]
+
+def ornaments_stepwise(problem, a): [stepwise(problem, f, t, rest_allowed = 2) for beat in beats(a) for f,t in zip(beat, beat[1:])]
+def downbeats_diatonic(problem, a): [no_false_relations(problem, p, q) for p,q in zip(beat_notes(a), beat_notes(a)[1:])]
+def ornaments_diatonic(problem, a): [no_false_relations(problem, p, q) for p,q in zip(a, a[1:] + a[:1])]
+def from_ornament_to_downbeat_stepwise(problem, a):
+	for x,y in context(beats(a), 2):
+		# x[0] == x[-1] || stepwise(x[-1], y[0])
+		problem.add_clause([[x[-1]['rest'], y[0]['rest'], x[0][i], -x[-1][i], *[y[0][i+j] for j in [0]*(BEAT_TUPLE > 2) + [-2,2,-5,5] if i+j in COFS]] for i in COFS])
+
+def reasonable_progression(problem, chords, except_when=[]):
+	for a,b in context(chords, 2):
+		# only active when minor -> minor
+		enforce_interval(problem, a.root, b.root, [-2,-1,1,2,3,4], [a.major, b.major], 1)
+		# only active when major -> minor
+		enforce_interval(problem, a.root, b.root, [-2,-1,1,2,3,4], [-a.major, b.major], 1)
+		# only active when minor -> major
+		enforce_interval(problem, a.root, b.root, [-4,-3,-2,-1,1], [a.major, -b.major], 1)
+		# only active when major -> major
+		enforce_interval(problem, a.root, b.root, [-4,-3,-2,-1,1], [-a.major, -b.major], 1)
+
+########
+# Contrapuntal & harmonic rules
+#########
+
+# marks downbeats that follow the form of a suspense and upbeats that follow the form of a NT or PT
+def are_beats_valid_dissonances(problem, a):
+	dissonance = [problem.make_var()]
+	problem.add_clause([-dissonance[0]])
+	for x,y,z in context(beats(a), 3):
+		dissonance.append(problem.make_var())
+		# sus & pt/nt
+		if (len(dissonance)-1) % MEASURE_TUPLE == 0:
+			enforce_interval(problem, x[0], y[0], [0], [-dissonance[-1]], 0)
+			if len(x) > 1: enforce_interval(problem, x[-1], y[0], [0], [-dissonance[-1]], 0)
+			enforce_interval(problem, y[0], z[0], [-2, 5], [-dissonance[-1]], 0)
+		else:
+			enforce_interval(problem, x[0], y[0], [2,-2,-5,5], [-dissonance[-1]], 0)
+			enforce_interval(problem, y[0], z[0], [2,-2,-5,5], [-dissonance[-1]], 0)
+
+	return dissonance
+
+# given some harmony and a bass note returns pitch vector of root of chord
+def get_root(problem, harmony, bass, except_when):
+	root = create_pitch(problem, COF_LO-4, COF_HI+3)
+	problem.add_clause([root['rest']] + [-x for x in except_when])
+
+	for c in COFS:
+		problem.add_clause([-bass[c], root[c], root[c+3], root[c-4]] + except_when)
+		if c+1 in harmony: problem.add_clause([-bass[c], -harmony[c+1], root[c]] + except_when)
+		if c+3 in harmony: problem.add_clause([-bass[c], -harmony[c+3], root[c+3]] + except_when)
+		if c-4 in harmony: problem.add_clause([-bass[c], -harmony[c-4], root[c-4]] + except_when)
+
+	return root
+
+# notes should be a tuple of (bitset, is_bass, short_circuit)
+def harmonic_vector(problem, _notes):
+	notes = list(chain(*_notes))
+
+	h = {c:problem.make_var() for c in range(-8,12)}
+	[no_false_relations(problem, a[0], b[0], True, False, True) for a,b in combinations(_notes[0], 2)]
+	[no_false_relations(problem, a[0], b[0], True, True, True) for a,b in combinations(notes, 2)]
+
+	# all non-dissonant notes make up part of the harmony
+	for p in COFS:
+		treble = [note for note in notes if not note[1]]
+		# note_in_harmony != note_is_dissonant
+		problem.add_clause([[h[p], -note[0][p], note[2]] for note in treble])
+		problem.add_clause([[-h[p], -note[0][p], -note[2]] for note in treble])
+		problem.add_clause([-h[p]] + [note[0][p] for note in treble])
+	
+	# the consonant bass note has special relationship to all harmony notes
+	for note in [note for note in notes if note[1]]:
+		for p in COFS:
+			# 1.1: -1 no 2nd inversions
+			# 1.2:  2 no 3th inversions
+			# 1.3:  5 no M7
+			# 1.4:  7 no m2
+			# optionally: no tritones (eg: no V7)
+			for i in [-1,  2,5,7,10, -2,-5,-7,-10, 6,-6]:
+				if p+i in h:
+					problem.add_clause([note[2], -note[0][p], -h[p+i]])
+
+			# -3  4 no minor and major 3th combined
+			#  6  1 no A4 and P5
+			#  1 -4 no m6 and P5
+			# -4  3 no m6 and M6
+			#  3 -2 no M6 and m7
+			#  4  6 no M3 and A4
+			#  1  3 no M6 and P5, eg no m3 m7 chords
+			# -4 -2 no m6 and m7
+			invalids = [(-3,4),(6,1),(1,-4),(-4,3),(3,-2),(4,6),(1,3),(-4,-2)]
+			invalids = [(x[0]+a*12, x[1]+b*12) for x in invalids for a in [-1,0,1] for b in [-1,0,1]]
+			for i,j in invalids:
+				if p+i in h and p+j in h:
+					problem.add_clause([note[2], -note[0][p], -h[p+i], -h[p+j]])
+
+			# 5: no 10 wo. 4, no bare minor 7ths
+			if p-2 in h and p+4 in h:
+				problem.add_clause([note[2], -note[0][p], -h[p-2], h[p+4]])
+
+	# at least one bass note must be non-dissonant so we can combine all roots to get one true root
+	roots = [get_root(problem, h, note, [is_dissonant]) for note,is_bass,is_dissonant in notes if is_bass]
+	root = create_pitch(problem)
+	#problem.add_clause([-root['rest']])
+	for p in set(root.keys()) - {'rest'}:
+		problem.add_clause([[root[p], -note[p], note['rest']] for note in roots])
+		problem.add_clause([-root[p]] + [note[p] for note in roots])
+		problem.add_clause([-root[p], h[p]])
+
+	major = problem.make_var()
+	seven = problem.make_var()
+	dim = problem.make_var()
+
+	for p in set(root.keys()) - {'rest'}:
+		if p+4 in h: problem.add_clause([-root[p], -h[p+4], major])
+		if p-3 in h: problem.add_clause([-root[p], -h[p-3], -major])
+
+		if p+5 in h: problem.add_clause([-root[p], -h[p+5], seven])
+		if p-2 in h: problem.add_clause([-root[p], -h[p-2], seven])
+		if p+5 in h and p-2 in h: problem.add_clause([-root[p], h[p+5], h[p-2], -seven])
+
+		if p+6 in h: problem.add_clause([-root[p], -h[p+6], dim])
+		if p-6 in h: problem.add_clause([-root[p], -h[p-6], dim])
+		if p+6 in h and p-6 in h: problem.add_clause([-root[p], h[p+6], h[p-6], -dim])
+
+	return Chord(root = root, chroma = h, major = major, seven = seven, dim = dim)
+
+# a is the higher voice, forbids parallel fifths and octaves
+def forbid_parallel_motion(problem, a, b, motion = [0,1]):
+	for x,y in zip(harmonies([a, b]), harmonies([a, b])[1:]):
+		for m in motion:
+			for p,q in product(range(COF_LO+m, COF_HI), range(COF_LO+m, COF_HI)):
+				if p != q:
+					problem.add_clause([-x[0][p], -x[1][p-m], -y[0][q], -y[1][q-m]])
+
+# consec. dissonances are allowed in some cases most notably in contrary stepwise motion
+# or in telescoped resolutions, but those cases have many conditions and exceptions
+# and since most of our contrapuntal infrastructure is focussed on the half note (eg 1st, 2nd 4th species)
+# blanket fixing 3th species is an easy out
+def forbid_consencutive_dissonances(problem, a, b):
+	is_dissonant = []
+
+	for x,y in zip(a,b):
+		is_dissonant.append(problem.make_var())
+		enforce_interval(problem, x, y, [-6,-4,-3,-1,0,1,3,4,6], [is_dissonant[-1]])
+
+	for x,y in zip(is_dissonant, is_dissonant[1:]):
+		problem.add_clause([-x, -y])
+
+	return is_dissonant
+
+def resolve_single_tritone(problem, a,b, c,d):
+	for p in range(COF_LO, COF_HI - 6):
+		problem.add_clause([-a[p], -b[p+6], d[p+1]])
+		problem.add_clause([-a[p], -b[p+6], c[p+4]] + ([c[p-3]] if p-3 in COFS else []))
+
+def resolve_tritones(problem, a,b, c,d):
+	resolve_single_tritone(problem, a,b, c,d)
+	resolve_single_tritone(problem, b,a, d,c)
+
+def follow_rules_of_counterpoint(problem, voices):
+	# 1st 2nd 4th species
+	is_dissonance  = [are_beats_valid_dissonances(problem, voice) for voice in voices]
+	annotated_beats = [[(note, i == len(voices)-1, d) for note,d in zip(beat_notes(voice), is_dissonance[i]) ] for i,voice in enumerate(voices)]
+	harmonies = [harmonic_vector(problem, harmony) for harmony in groupn(list(zip(*annotated_beats)), MEASURE_TUPLE) ]
+	
+	#[downbeats_diatonic(problem, voice) for voice in voices]
+	[resolve_tritones(problem, *x, *y) for a,b in combinations(voices, 2) for x,y in context(list(zip(beat_notes(a), beat_notes(b))), 2)]
+	[forbid_parallel_motion(problem, a, b) for a,b in combinations(voices, 2)]
+
+	# bass or treble is dissonant, but not both
+	for vert in zip(*is_dissonance): problem.add_clause([[-d, -vert[-1]] for d in vert[:-1]])
+	# no consec. dissonances within a single voice
+	for voice in is_dissonance: problem.add_clause([[-a, -b] for a,b in context(voice, 2)])
+
+	# 3th species, basically allows little else other than connective tissue
+	if BEAT_TUPLE > 1:
+		[ornaments_stepwise(problem, voice) for voice in voices]
+		[from_ornament_to_downbeat_stepwise(problem, voice) for voice in voices]
+		#[ornaments_diatonic(problem, voice) for voice in voices]
+		[forbid_consencutive_dissonances(problem, a, b) for a,b in combinations(voices, 2)]
+		[forbid_parallel_motion(problem, beat_notes(a), beat_notes(b)) for a,b in combinations(voices, 2)]
+
+	return harmonies, is_dissonance
+
+##############
+# Quality control
+##############
+
+# normally stepwise motion is encouraged because it allows dissonance
+# but occasionally a solution might occur that uses just broken chords
+# in that case it is useful to force some stepwise motion to get a more dynamic solution
+def minimal_stepwise_count(problem, voice, n):
+	is_stepwise = [problem.make_var() for _ in range(len(voice)-1)]
+	for a,b,v in zip(voice, voice[1:], is_stepwise):
+		enforce_interval(problem, a, b, [-5,-2,2,5], [-v])
+	problem.atleast(n, is_stepwise)
+	return is_stepwise
+
+# many complicated contrapuntal forms can be solved by making the whole dux a single pitch
+# by simply requiring some minimum amount of different pitches in your dux you'll get actual solutions
+def minimal_downbeat_variation(problem, voice, n):
+	h = [problem.make_var() for _ in COFS]
+	for p in COFS:
+		problem.add_clause([[ h[p], -note[p]] for note in beat_notes(voice)])
+		problem.add_clause([-h[p]] + [note[p] for note in beat_notes(voice)])
+
+	problem.atleast(n, h)
+	return h
+
+def maximum_rests(problem, voice, n):
+	problem.atmost(n, [note['rest'] for note in voice])
+
+def maximum_note_length(problem, voice, n):
+	is_different = [problem.make_var() for _ in range(len(voice)-1)]
+	for a,b,v in zip(voice, voice[1:], is_different):
+		enforce_interval(problem, a, b, [c for c in COFS if not c % 12 == 0], [-v])
+
+	for vs in context(is_different, n):
+		problem.atleast(1, vs)
+
+	return is_different
+
+# progression in CoF, first value 0, progression is relative to first value
+def has_progression(problem, pitches, progression, n = 1, allow_edge = True):
+	s = []
+	for segment in context(pitches + pitches[:len(progression)]*allow_edge, len(progression)):
+		s.append(problem.make_var())
+		problem.add_clause([-s[-1], -segment[0]['rest']])
+
+		for c in segment[0].keys():
+			if c != 'rest':
+				clauses = [[-segment[0][c], -s[-1], p[c+q]] if q+c in p else [-segment[0][c], -s[-1]] for p,q in zip(segment[1:], progression[1:])]
+				problem.add_clause(clauses)
+
+	problem.add_clause(s)
+	#problem.atleast(n, s)
+	return s
+
+#########
+# Generating output
+#########
+
+def getprop(solution, bitdict): return [k for k,v in bitdict.items() if v is None or v in solution][0]
+def getindex(solution, bitlist): return [k for k,v in enumerate(bitlist) if v is None or v in solution][0]
+def parse_voice(solution, voice): return [getprop(solution, note) if getprop(solution, note) != 'rest' else 100 for note in voice]
+
+NOTE_NAMES = {
+	-7: 'Cb',-6: 'Gb',-5: 'Db',-4: 'Ab',-3: 'Eb',-2: 'Bb', -1: 'F',
+	 0: 'C',  1: 'G',  2: 'D',  3: 'A',  4: 'E',  5: 'B',   6: 'F#',
+	 7: 'C#', 8: 'G#', 9: 'D#',10: 'A#',11: 'E#',12: 'B#', 13: 'Fx'}
+
+INTERVAL_NAMES = {
+	-7: 'd1',-6: 'd5',-5: 'm2',-4: 'm6',-3: 'm3',-2: 'm7',-1: 'P4', 
+	 0: 'P1', 1: 'P5', 2: 'M2', 3: 'M6', 4: 'M3', 5: 'M7', 6: 'A4', 
+	 7: 'A1', 8: 'A5', 9: 'A2',10: 'A6',11: 'A3',12: 'A7',
+	}
+
+ACC_NAMES = {-2:'𝄫', -1:'♭',0:' ',1:'♯', 2:'𝄪'}
 
 class Solution:
-	def __init__(self, time, voices, progression, transposition, model):
-		# store data in easy to access format
-		self.time = time
-		self.model = dict((abs(v), v > 0) for v in model)
-		self.progression = progression
-		self.voices = [[(
-			dia_from_chroma([self.model[x] for x in note.pitch].index(True)),
-			-chroma_is_flat([self.model[x] for x in note.pitch].index(True)),
-			note.dissonance_name(self.model)) for note in voice] for voice in voices]
-		self.intervals = [[([self.model[x] for x in note.intervals] + [True]).index(True) for note in voice] for voice in voices]
-
-		self.transposition = [[self.model[t] for t in transpose].index(True) for transpose in transposition]
-		self.compute_statistics()
-
-	def compute_statistics(self):
-		r,d = self.voices[0], self.voices[2]
-		self.static = sum([abs(x[0]-y[0]) == 0 for x,y in list(zip(r, r[1:] + r[:1])) + list(zip(d, d[1:] + d[:1]))])
-		self.steps = sum([abs(x[0]-y[0]) in [1,6]  for x,y in list(zip(r, r[1:] + r[:1])) + list(zip(d, d[1:] + d[:1]))])
-		self.variety = prod(Counter([x for x,y,_ in self.voices[0]]).values())
-		self.total_notes = 64-self.static
-		self.score = log(1+(self.steps)**2*self.total_notes**2)
+	def __init__(self, solution, voices):
+		self.voices = [(getprop(solution, tr), getprop(solution, ti), parse_voice(solution, voice)) for tr,ti,voice in voices]
 
 	def __str__(self):
 		s = ''
-		for v,t,o,i in zip(self.voices, [0] + self.transposition, [0] + list(self.time), self.intervals):
-			s = f"{s}{['   ', '2nd', '3th', '4th', '5th', '6th', '7th'][t]} -{o:2}m {''.join(['cdefgab'[n] + ({-1:'♭',0:' ',1:'♯'}[a]) for n,a,d in v])}\n"
-			s = f"{s}         {''.join(d for n,a,d in v)}\n"
-			#s = f"{s}interval {' '.join(str(a) for a in i)}\n"
-
-		s = s + f'stepcount = {self.steps}\n'
-		s = s + f'variety   = {self.variety:.3f}\n'
-		s = s + f'note_count= {self.total_notes}\n'
-		s = s + f'score     = {self.score:.3f}'
+		for tr,ti,voice in self.voices:
+			notes = ''.join(['cdefgab'[cof_to_diatonic(p)] + ACC_NAMES[cof_to_accidentals(p)] if p < 100 else '  ' for p in voice])
+			s = f'{s}{"  -"[tr[1]]}{INTERVAL_NAMES[tr[0]]} {ti[0]:2}*{ti[1]:2} {"|".join(groupn(notes, MEASURE_TUPLE*BEAT_TUPLE*2))}\n'
 		return s
 
-
-class Note:
-	def __init__(self, problem, strong_beat, bass, name):
-		self.name = name
-		self.strong_beat = strong_beat
-		self.bass = bass
-		self.pitch = [problem.make_var(f'{name}-p{c}') for c in range(12)]
-		self.intervals = []
-		self.suspension = problem.make_var()
-		self.passing = problem.make_var()
-		problem.add_clause(self.pitch)
-
-	def pitches_for_dia(self, p): return [self.pitch[x] for x in chromas_from_dia(p)]
-	def dissonance(self): return self.suspension if self.strong_beat else self.passing
-
-	def dissonance_name(self, solution):
-		return {self.suspension: 'S-', self.passing: 'P ', None: '  '}[self.dissonance() if not self.dissonance() is None and solution[self.dissonance()] else None]
-
-# we really only need -1, 0, 1, <anything else>
-def store_intervals(problem, a, b):
-	intervals = [problem.make_var(f'{a.name} {b.name} +{i}') for i in range(8)]
-	problem.atmost(1, intervals)
-	for i,j in product(range(12), range(12)):
-		d = (dia_from_chroma(j) - dia_from_chroma(i)) % 7
-		if d == 0 and i != j: d = 7
-		problem.add_clause([-a.pitch[i], -b.pitch[j], intervals[d]])
-
-	return intervals
-
-def store_intervals_stepwise(problem, a, b):	
-	intervals = [problem.make_var(), problem.make_var(), problem.make_var(), problem.make_var(), problem.make_var()]
-
-	for i in range(12):
-		for j in [-2, -1, 0, 1, 2]:
-			problem.add_clause([-a.pitch[i], -b.pitch[(i+j)%12], intervals[j]])
-			problem.add_clause([a.pitch[i], -b.pitch[(i+j)%12], -intervals[j]])
-			problem.add_clause([-a.pitch[i], b.pitch[(i+j)%12], -intervals[j]])
-
-	diatonic = [intervals[0], problem.make_var(), problem.make_var()]
-	problem.or_connect(intervals[1], intervals[2], diatonic[1])
-	problem.or_connect(intervals[-1], intervals[-2], diatonic[-1])
-	return diatonic
-
-
-# limits the allowed chromatic interval between two diatonic interval, here is the no-bueno table (symmetric on the other side)
-# Gb: B E A D   Db: B E A   Ab: B E  Eb: B  Bb:  F :
-def melodic_relationship(problem, a, b):
-	for i,j in product(range(12), range(12)):
-		#1 < abs(i-j)%12 < 11 and 
-		if is_aug_or_dim(i, j):
-			problem.add_clause([-a.pitch[i], -b.pitch[j]])
+def export_to_xml(voices):
+	def assign_octaves(voice, pitch_center = 0):
+		def near(p, q): return p%7 + 7*(q//7 + (q%7 - p%7 >= 4) - (q%7 - p%7 <=-4))
+		voice = [cof_to_spelling(note) if note < 100 else None for note in voice]
+		for i in range(len(voice)):
+			a,b = voice[i-1:i+1] if i else ((pitch_center, 0), voice[0])
+			voice[i] = (near(b[0], a[0] if a and (b[0] - a[0]) % 7 in [0,1,6] else pitch_center), b[1]) if b else None
+		return voice			
 	
-	# and forbid tritones too
-	for i in range(12):
-		problem.add_clause([-a.pitch[i], -b.pitch[(i+6)%12]])
+	score = stream.Score(id='score')
+	voices = [assign_octaves(voice, 63) for voice in voices]
 
-def forbid_false_relations(problem, a, b):
-	for c,d in product(range(12), range(12)):
-		if 1 < abs(c-d)%12 < 11 and is_aug_or_dim(c, d):
-			problem.add_clause([-a.pitch[c], -b.pitch[d]])
+	for i, v in enumerate(voices):
+		part = stream.Part(id=f'part{i}')
+		center = sorted([note[0] for note in v if note])[len([x for x in v if x])//2]
+		if center <= 53: part.append(clef.BassClef())
+		elif center <= 60: part.append(clef.Treble8vbClef())
+		elif center >  60: part.append(clef.TrebleClef())
 
-# The only tritones are
-# Gb C -> Db F
-# G Db -> Ab C
-# Ab D -> Eb Gb
-# A Eb -> Bb Db
-# Bb E -> F Ab
-# the one on the tonic is special, though we will omit the modulation to Gb
-# B  F -> E C, Eb C, Gb A
-# also note that any tritone can be repeated
-def resolve_tritone(problem, a1, a2, b1, b2):
-	for v,w,x,y in [(a1,a2,b1,b2), (a2,a1,b2,b1)]:
-		for p in range(5):
-			problem.add_clause([-v.pitch[p], -w.pitch[p + 6], x.pitch[p],   x.pitch[p+1 if p % 2 == 0 else p-2]])
-			problem.add_clause([-v.pitch[p], -w.pitch[p + 6], y.pitch[p+6], y.pitch[(p+6)-2 if p % 2 == 0 else (p+6)+1]])
-			problem.add_clause([-v.pitch[p], -w.pitch[p + 6], -x.pitch[p],   -y.pitch[(p+6)-2 if p % 2 == 0 else (p+6)+1]])
-			problem.add_clause([-v.pitch[p], -w.pitch[p + 6], -y.pitch[p+6], -x.pitch[p+1 if p % 2 == 0 else p-2]])
+		if MEASURE_TUPLE == 2: part.append(meter.TimeSignature('2/2'))
+		if MEASURE_TUPLE == 3: part.append(meter.TimeSignature('3/2'))
 
-		problem.add_clause([-v.pitch[5], -w.pitch[11], y.pitch[11], y.pitch[0]])
-		problem.add_clause([-v.pitch[5], -w.pitch[11], x.pitch[5], x.pitch[3], x.pitch[4]])
-		problem.add_clause([-v.pitch[5], -w.pitch[11], -x.pitch[5], -y.pitch[0]])
-		problem.add_clause([-v.pitch[5], -w.pitch[11], -y.pitch[11], -x.pitch[3]])
-		problem.add_clause([-v.pitch[5], -w.pitch[11], -y.pitch[11], -x.pitch[4]])
+		part.append(instrument.Vocalist())
+		pd, pa = -1,-2
 
-N = 4
+		BEAT_LENGTH = 2 if BEAT_TUPLE == 1 else 1
 
-def solve_for_time(time):
-	file = open('solutions_' +  '_'.join(map(str, time)), 'w')
+		for i,n in enumerate(v):
+			degree,acc = n if n else (None, None)
+			if (degree, acc) == (pd, pa):
+				part[-1].duration = duration.Duration(part[-1].duration.quarterLength + BEAT_LENGTH )
+			else:
+				if degree:
+					part.append(note.Note(diatonic_to_chromatic(degree)-36-12*(i==len(v)-1), accidental=acc, duration=duration.Duration(BEAT_LENGTH)))
+				else:
+					part.append(note.Rest(duration=duration.Duration(BEAT_LENGTH)))
+
+			pd, pa = degree, acc
+
+		score.insert(0, part)
+
+	return musicxml.m21ToXml.GeneralObjectExporter(score).parse().decode('utf-8').strip()
+
+
+#######
+# A specific canonic problem
+#######
+def square_canon():
 	problem = Problem()
+	M = MEASURE_TUPLE*BEAT_TUPLE
+	N = 16*M
 
-	voices = [[Note(problem, n % 2 == v % 2, v == 3, f'{v}-{n}' ) for n in range(N*N*2)] for v in range(4)]
-	inverses, reverses, verticals = [1,0,1], [1,0,1], [0,1,1]
+	dux = create_dux(problem, N)
+	problem.add_clause([dux[0][0]])
 
-	transposition = [[problem.make_var() for p in range(7)] for voice in voices[1:]]
-	for t in transposition: problem.exactly(1, t)
+	ordering = [12,8,4,0, 13,9,5,1, 14,10,6,2, 15,11,7,3]
+	ordering = [y for x in ordering for y in range(x*M, (x+1)*M)]
 
-	# transposition is diatonic, that means that if one 'pair of pitches' in one measure is selected
-	# than you can choose from a mapped pair of pitches in another measure
-	# eg: ((a | b) = (c | d)) | !i
-	# eq: (a | b | !c | !i) & (a | b | !d | !i) & (c | d | !a | !i) & (c | d | !b | !i)
-	for i,p,q in product(range(N*N*2), range(7), range(7)):
-		for v, inv, t in zip(voices[1:], inverses, transposition):
-			ab = voices[0][i].pitches_for_dia(p)
-			cd = v[i].pitches_for_dia(6-q if inv else q)
-			for x in cd: problem.add_clause(ab + [-x, -t[(q-p)%7]])
-			for x in ab: problem.add_clause(cd + [-x, -t[(q-p)%7]])
+	DIATONIC = PitchTransform(list(range(7)), 7, [1])
+	rectus   = transformational_equivalence(problem, dux, PitchTransform([0], 7, [1]), TimeTransform([0], [1]), 0, (2*MEASURE_TUPLE*BEAT_TUPLE)) 
+	retro    = transformational_equivalence(problem, dux, DIATONIC, TimeTransform(range(0,N,1), [-1]), 0, (2*MEASURE_TUPLE*BEAT_TUPLE))
+	derectus = transformational_equivalence(problem, dux, DIATONIC, TimeTransform(range(0,N,1), [1], [ordering]), 0, (2*MEASURE_TUPLE*BEAT_TUPLE))
+	deretro  = transformational_equivalence(problem, dux, DIATONIC, TimeTransform(range(0,N,1), [-1], [ordering]), 0, (2*MEASURE_TUPLE*BEAT_TUPLE))
 
-	# now apply time transformations by shuffling actual arrays of variables
-	voices = [voices[0]] + [rotate((columns(voice, N, 2) if vertical else voice)[::reverse*-2+1], t) for voice, reverse, vertical, t in zip(voices[1:], reverses, verticals, time)]
+	voices = [rectus, retro, derectus, deretro]
+	harmony, is_dissonance = follow_rules_of_counterpoint(problem, [v[-1] for v in voices])
+	maximum_rests(problem, dux, 0)
+	maximum_note_length(problem, dux, 4)
+	minimal_downbeat_variation(problem, dux, 5)
 
-	# and then we can simply create a matrix that we can query without caring about the above transforms
-	# all the following code doesn't care about the canonic form
-	progression = list(zip(*voices))
-	contexts = [list(zip(rotate(v, -1), v)) for v in voices]
+	for chord in harmony:
+		problem.add_clause([-chord.root['rest']])
 
-	for c in contexts:
-		for x,y in c:
-			x.intervals = store_intervals_stepwise(problem, x, y)
+	for chord in harmony:
+		for p in set(chord.root.keys()) - {'rest'}:
+			problem.add_clause([-chord.root[p], chord.chroma[p]])
 
-	for c in contexts:
-		for x,y in c:
-			melodic_relationship(problem, x, y)
+	maximum_note_length(problem, [chord.root for chord in harmony[:-1]], 2)
 
-		for x,y in c[::2]:
-			problem.add_clause([-y.suspension, x.intervals[0]])
-			problem.add_clause([-y.suspension, y.intervals[-1]])
-			problem.add_clause([y.suspension, -x.intervals[0], -y.intervals[-1]])
+	for i,model in enumerate(problem.solutions_cpsat([x for note in dux for x in note.values()])):
+		transforms = []
+		for voice in [retro, derectus, deretro]:
+			trans = [k for k,v in voice[0].items() if model[v-1] > 0][0][0]
+			timed = [k for k,v in voice[1].items() if model[v-1] > 0][0][0]
+			transforms.append((trans, timed))
 
-		for x,y in c[1::2]:
-			problem.add_clause([-y.passing, x.intervals[1], x.intervals[-1]])
-			problem.add_clause([-y.passing, y.intervals[1], y.intervals[-1]])
-			problem.add_clause([y.passing, -x.intervals[1], -y.intervals[-1]])
-			problem.add_clause([y.passing, -x.intervals[-1], -y.intervals[1]])
-			problem.add_clause([y.passing, -x.intervals[1], -y.intervals[1]])
-			problem.add_clause([y.passing, -x.intervals[-1], -y.intervals[-1]])
+		print(i, *transforms)
+		print(' '.join([NOTE_NAMES[x].ljust(2) if x < 100 else '- ' for x in parse_voice(model, dux)]))
+		print(' '.join([NOTE_NAMES[x].ljust(2) if x < 100 else '- ' for x in parse_voice(model, [chord.root for chord in harmony[:-1]])]))
+		print(' '.join(['M ' if x else 'm ' for x in [model[chord.major-1] > 0 for chord in harmony[:-1]]]))
 
-	# forbid combining resolving supensions and passing tones within a single measure
-	# you may combine multiple suspensions, or have multiple passing tones however
-	for strong,weak in zip(progression[::2], progression[1::2]):
-		for s,w in product(strong, weak):
-			problem.add_clause([-s.dissonance(), -w.dissonance()])
+		for x in is_dissonance:
+			markings = ['#' if model[d-1] > 0 else ' ' for i,d in enumerate(x)]
+			markings = '|'.join([''.join(x) for x in groupn(markings, 4 if MEASURE_TUPLE == 2 else 3)]) + '||'
+			print(markings)
+		print()
+
+
+		with open(f'square/solution_{i:04}.musicxml', 'w') as musicfile:
+			musicfile.write(export_to_xml([x[-1] for x in Solution(model, voices).voices]))
+
+# n is the amount of measures in the dux
+# multi is how many simultanious such canons are present
+def multi_modulation_canon(n, multi):
+	problem = Problem()
+	M = MEASURE_TUPLE*BEAT_TUPLE
+	N = n*M
+
+	mod = 4 - (MEASURE_TUPLE==3)
+
+	duxs, voices = [], []
+	for _ in range(multi):
+		dux = create_dux(problem, N)
+		problem.add_clause([dux[0][0]])
+		maximum_rests(problem, dux, 3)
+		#maximum_note_length(problem, dux, MEASURE_TUPLE+1)
+		duxs.append(dux)
+
+		dims = []
+		for i in range(MEASURE_TUPLE):
+			dims.append(transformational_equivalence(problem, dux, PitchTransform([i*mod], 12, [1]), TimeTransform([0], [1]), mod, (2*MEASURE_TUPLE*BEAT_TUPLE) * (i == MEASURE_TUPLE-1)))
 		
-		# no double suspensions
-		problem.atmost(1, [s.dissonance() for s in strong])
-		# no triple passing/neighbours
-		problem.atmost(2, [s.dissonance() for s in weak])
+		dim = [dims[0][0], dims[0][1], sum([x[2] for x in dims], start=[])]
+		aug = transformational_equivalence(problem, dux, PitchTransform(list(range(12)), 12, [-1]), TimeTransform(list(range(0, N, MEASURE_TUPLE)), [MEASURE_TUPLE]), mod, (2*MEASURE_TUPLE*BEAT_TUPLE))
+		
+		voices += [dim, aug]
 
+	voices = voices[::2] + voices[1::2]
+	# fix a specific voice
+	# for i,p in enumerate([0,1,-1,0, 1,5,0,1, 2,0,5,1]):
+	# 	problem.add_clause([duxs[-1][i][p]])
 
-	# is weakly true but strongly false
-	harmonic_vectors = [[problem.make_var() for _ in range(12)] for _ in range(len(progression)//2)]
-	for i,strong,weak in zip(range(len(progression)//2), progression[::2], progression[1::2]):
-		for a,b in combinations(strong + weak, 2):
-			forbid_false_relations(problem, a, b)
+	is_dissonance  = [are_beats_valid_dissonances(problem, voice) for voice in [v[-1] for v in voices]]
+	annotated_beats = [[(note, i == len(voices)-1, d) for note,d in zip(beat_notes(voice), is_dissonance[i]) ] for i,voice in enumerate([v[-1] for v in voices])]
+	harmonies = [harmonic_vector(problem, harmony) for harmony in groupn(list(zip(*annotated_beats)), MEASURE_TUPLE)]
+	[forbid_parallel_motion(problem, a, b) for a,b in combinations([v[-1] for v in voices], 2)]
 
-		for p in range(12):
-			for note in strong[:-1] + weak[:-1]:
-				problem.add_clause([harmonic_vectors[i][p], -note.pitch[p], note.dissonance()])
+	for chord in harmonies:
+		problem.add_clause([-chord.root['rest']])
 
-			# this is not technically correct as some of these notes may be dissonants
-			problem.add_clause([-harmonic_vectors[i][p]] + [note.pitch[p] for note in strong[:-1] + weak[:-1]])
-	
-	for i,strong,weak in zip(range(len(progression)//2), progression[::2], progression[1::2]):
-		h = harmonic_vectors[i]
-		for note in strong[-1:] + weak[-1:]:
-			for p in range(12):
-				# 1: no 1,2,5,11 or semitone distances, no 2nd inversion or M7 chords
-				problem.add_clause([note.dissonance(), -note.pitch[p], -h[p-11]])
-				problem.add_clause([note.dissonance(), -note.pitch[p], -h[p-10]])
-				problem.add_clause([note.dissonance(), -note.pitch[p], -h[p- 7]])
-				problem.add_clause([note.dissonance(), -note.pitch[p], -h[p- 1]])
-				
-				# 2: no semitones, no '4 8', all augemented chords are forbidden, symmetrical so this suffices
-				# 3: no '4 6', no 3th inversions (the tritone defines the tonic) 
-				# 4: no '7 9', no minor 7 chords
-				# 5: no '8 10', that's just 3 2nds
-				for i,j in [(3,4),(6,7),(7,8),(8,9),(9,10),(4,6),(7,9),(8,10)]:
-					problem.add_clause([note.dissonance(), -note.pitch[p], -h[(p+i)%12], -h[(p+j)%12]])
+	for chord in harmonies:
+		for p in set(chord.root.keys()) - {'rest'}:
+			problem.add_clause([-chord.root[p], chord.chroma[p]])
 
-				# 5: no 10 wo. 4, no bare minor 7ths
-				problem.add_clause([note.dissonance(), -note.pitch[p], -h[(p+10)%12], h[(p+4)%12]])
+	for i,model in enumerate(problem.solutions_cpsat([x for dux in duxs for note in dux for x in note.values()])):
+		aug_dux1_transposition = [k for k,v in aug[0].items() if model[v-1] > 0]
+		aug_dux1_time = [k for k,v in aug[1].items() if model[v-1] > 0]
 
-	# none of the movements between 2 pairs of notes may be parallel perfects
-	for notes_a, notes_b in zip(progression, progression[1:] + progression[:1]): # 16
-		for a,b in combinations(list(zip(notes_a, notes_b)), 2): # 6
-			for i,j in product(range(12), range(12)):
-				if i != j:
-					problem.atleast(1, [-a[0].pitch[(i+7)%12], -b[0].pitch[i], -a[1].pitch[(j+7)%12], -b[1].pitch[j]])
-					problem.atleast(1, [-a[0].pitch[(i-2)%12], -b[0].pitch[i], -a[1].pitch[(j-2)%12], -b[1].pitch[j]])
-					problem.atleast(1, [-a[0].pitch[i], -b[0].pitch[i], -a[1].pitch[j], -b[1].pitch[j]])
+		print(i, aug_dux1_transposition[0][0], aug_dux1_time[0][0])
+		print(' '.join([NOTE_NAMES[x].ljust(2) if x < 100 else '- ' for x in parse_voice(model, sum(duxs, start=[]))]))
+		print(' '.join([NOTE_NAMES[x].ljust(2) if x < 100 else '- ' for x in parse_voice(model, [chord.root for chord in harmonies[:-1]])]))
+		print(' '.join(['M ' if x else 'm ' for x in [model[chord.major-1] > 0 for chord in harmonies[:-1]]]))
 
-	# and harmonically, although here we allow them to resolve without preparation
-	# as a nice V7 -> I is too good to pass up really
-	for a, b in zip(progression, progression[1:] + progression[:1]): # 16
-		for x,y in combinations(zip(a, b), 2):
-			resolve_tritone(problem, x[0], y[0],  x[1], y[1])
+		for x in is_dissonance:
+			markings = ['#' if model[d-1] > 0 else ' ' for i,d in enumerate(x)]
+			markings = '|'.join([''.join(x) for x in groupn(markings, 4 if MEASURE_TUPLE == 2 else 3)]) + '||'
+			print(markings)
+		print()
 
-	# now let's do some more subjective minimal quality things
-	# 1/3 stepwise motion is not a lot but works quite well in filtering a lot of the non-solutions
-	problem.atleast(24, [x.intervals[i] for x in voices[0] + voices[2] for i in (1, -1)])
-	# having a few suspensions really adds something too, this one filters super-hard though
-	problem.atleast(1, [x.suspension for x in voices[0] + voices[2] + voices[1] + voices[3] if x.strong_beat])
+		with open(f'out/solution_{i:04}.musicxml', 'w') as musicfile:
+			musicfile.write(export_to_xml([x[-1] for x in Solution(model, voices).voices]))
 
-	for model in problem.solutions([x for note in voices[0] for x in note.pitch]):
-		solution = Solution(time, voices, progression, transposition, model)
-		file.write(str(solution) + '\n')
-		file.flush()
+def augmentation_canon(n):
+	problem = Problem()
+	M = MEASURE_TUPLE*BEAT_TUPLE
+	N = n*M
 
-	return True
+	dux = create_dux(problem, N)
+	problem.add_clause([dux[0][0]])
+	maximum_rests(problem, dux, 0)
+	maximum_note_length(problem, dux, MEASURE_TUPLE+1)
 
-from multiprocessing import *
-if __name__ == '__main__':
-    #solve_for_time((0,0,0))
-    with Pool(processes=32) as pool:
-    	result = list(pool.imap_unordered(solve_for_time, product(list(range(0, N*N*2, 2)), list(range(0, N*N*2, 2)), list(range(0, N*N*2, 2)))))
+	voices = []
+	for aug_factor in [1,2,3]:
+		pitch = PitchTransform(list(range(12)), 12, [1,-1]) if aug_factor else PitchTransform([0], 12, [1])
+		voices.append(transformational_equivalence(problem, dux, pitch, TimeTransform([0], [aug_factor]), 0, 6*N-aug_factor*N + (2*MEASURE_TUPLE*BEAT_TUPLE)))
+
+	is_dissonance = [are_beats_valid_dissonances(problem, voice) for voice in [v[-1] for v in voices]]
+	annotated_beats = [[(note, i == len(voices)-1, d) for note,d in zip(beat_notes(voice), is_dissonance[i]) ] for i,voice in enumerate([v[-1] for v in voices])]
+	harmonies = [harmonic_vector(problem, harmony) for harmony in groupn(list(zip(*annotated_beats)), MEASURE_TUPLE)]
+	[forbid_parallel_motion(problem, a, b) for a,b in combinations([v[-1] for v in voices], 2)]
+
+	for chord in harmonies:
+		problem.add_clause([-chord.root['rest']])
+
+	for chord in harmonies:
+		for p in set(chord.root.keys()) - {'rest'}:
+			problem.add_clause([-chord.root[p], chord.chroma[p]])
+
+	for i,model in enumerate(problem.solutions_cpsat([x for note in dux for x in note.values()])):
+		print(i)
+		print(' '.join([NOTE_NAMES[x].ljust(2) if x < 100 else '- ' for x in parse_voice(model, dux)]))
+		print(' '.join([NOTE_NAMES[x].ljust(2) if x < 100 else '- ' for x in parse_voice(model, [chord.root for chord in harmonies[:-1]])]))
+		print(' '.join(['M ' if x else 'm ' for x in [model[chord.major-1] > 0 for chord in harmonies[:-1]]]))
+
+		for x in is_dissonance:
+			markings = ['#' if model[d-1] > 0 else ' ' for i,d in enumerate(x)]
+			markings = '|'.join([''.join(x) for x in groupn(markings, 4 if MEASURE_TUPLE == 2 else 3)]) + '||'
+			print(markings)
+		print()
+
+		with open(f'aug/solution_{i:04}.musicxml', 'w') as musicfile:
+			musicfile.write(export_to_xml([x[-1] for x in Solution(model, voices).voices]))
+
+# multi_modulation_canon(6, 2)
+# square_canon()
+augmentation_canon(6)
